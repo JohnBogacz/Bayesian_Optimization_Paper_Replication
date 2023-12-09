@@ -7,6 +7,9 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from bayes_opt import UtilityFunction, BayesianOptimization
 import warnings
+from joblib import Parallel, delayed
+import random
+import copy
 
 
 class TopMetric:
@@ -21,7 +24,7 @@ class TopMetric:
         self.metric_history = list()
 
     def metric(self) -> float:
-        return self.numerator / len(self.__candidates_indexes)
+        return float(self.numerator / len(self.__candidates_indexes))
 
     def update_metric(self, idx: int) -> None:
         if idx in self.__candidates_indexes:
@@ -40,10 +43,10 @@ class Model(TopMetric, UtilityFunction):
     ) -> None:
         super().__init__(df=df, n_top_candidates=n_top_candidates)
         self.seed = seed
-        self.pbounds = dict[str, tuple]
+        self.pbounds = dict()
         self.df = df
 
-        self.pool_candidates = df.index.tolist()
+        self.pool_candidates = list(df.index.tolist())
         self.observed_candidates = list()
 
         # (1) Running some initialization stuff
@@ -56,23 +59,24 @@ class Model(TopMetric, UtilityFunction):
         in the varible name when BayesianOptimization passes the column name
         into the black-box/f/surrogate-model
         """
+        remove = {
+            "(": "",
+            ")": "",
+            "%": "",
+            "uL/min": "",
+            " ": "",
+            "(measured)": "",
+            "(S/cm)": "",
+        }
         for col in list(df.columns)[:-1]:
             smallest = df[col].min()
             largest = df[col].max()
-            remove = {
-                "(": "",
-                ")": "",
-                "%": "",
-                "uL/min": "",
-                " ": "",
-                "(measured)": "",
-                "(S/cm)": "",
-            }
+
             for key, val in remove.items():
                 col = col.replace(key, val)
             self.pbounds[col] = (smallest, largest)
 
-    def f_surrogate_model(self, *args):
+    def f_surrogate_model(self, **args):
         """
         For the template class this will server as the basic black-box function
         where we will will return the loss/objective_metric for the closest data-point
@@ -82,46 +86,57 @@ class Model(TopMetric, UtilityFunction):
         Note: Using *args as the input will be a tuple of columns, each datasets has different
         number of columns.
         """
-        features = self.df.values[:-1]
+
         objective_metric = self.df.values[-1]
 
-        if len(args) != features.shape[0]:
-            raise Exception("Error")
+        col = dict()
+        for c in list(self.df.columns)[:-1]:
+            col[c] = self.df[c]
 
-        temp_matrix = np.zeros_like(features)
-        for arg_i in range(args):
-            # matrix_col = (matrix_col - arg)^2
-            temp_matrix[:, arg_i] = np.exp2(features[:, arg_i] - args[arg_i])
-        row_sums = np.sum(temp_matrix, axis=1)
-        row_sums = np.sqrt(row_sums)
-        smallest_dist = np.argmin(row_sums)
+        for c, val in args.items():
+            col[c] = np.exp2(col[c] - val)
 
-        closest_objective_metric = objective_metric[smallest_dist]
-        return closest_objective_metric
+        combined_column = np.vstack(tuple(col.values()))
+        combined_column = np.sum(combined_column, axis=1)
+        combined_column = np.sqrt(combined_column)
+        smallest_dist = np.argmin(combined_column)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            idx = np.argwhere(
+                combined_column == combined_column[smallest_dist]
+            ).flatten()
+            idx = idx[0]
+        return objective_metric[idx]
 
-    def add_candidate(self, *args) -> None:
+    def add_candidate(self, **args) -> None:
         """
         In order to implement like research paper we will need list of candidates
         """
-        features = self.df.values[:-1]
+        col = dict()
+        for c in list(self.df.columns)[:-1]:
+            col[c] = self.df[c]
 
-        if len(args) != features.shape[0]:
-            raise Exception("Error")
+        for c, val in args.items():
+            col[c] = np.exp2(col[c] - val)
 
-        temp_matrix = np.zeros_like(features)
-        for arg_i in range(args):
-            # matrix_col = (matrix_col - arg)^2
-            temp_matrix[:, arg_i] = np.exp2(features[:, arg_i] - args[arg_i])
-        row_sums = np.sum(temp_matrix, axis=1)
-        row_sums = np.sqrt(row_sums)
-        smallest_dist_idx = np.argmin(row_sums)
+        combined_column = np.vstack(tuple(col.values()))
+        combined_column = np.sum(combined_column, axis=1)
+        combined_column = np.sqrt(combined_column)
+        smallest_dist = np.argmin(combined_column)
 
-        if smallest_dist_idx in self.observed_candidates:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            idx = np.argwhere(
+                combined_column == combined_column[smallest_dist]
+            ).flatten()
+            idx = idx[0]
+
+        if idx in self.observed_candidates:
             return None
         else:
-            self.observed_candidates.append(smallest_dist_idx)
-            self.pool_candidates.remove(smallest_dist_idx)
-            self.update_metric(idx=smallest_dist_idx)
+            self.observed_candidates.append(idx)
+            self.pool_candidates.remove(idx)
+            self.update_metric(idx=idx)
 
 
 class RF(Model):
@@ -154,14 +169,48 @@ class RF(Model):
 
     def utility(self, x, gp, y_max):
         if self.aqu_type == "UCB2":
-            return self._ucb(x, gp, self.kappa)
+            return self._ucb(x, gp, 1)
         if self.aqu_type == "EI":
-            return self._ei(x, gp, y_max, self.xi)
+            return self._ei(x, gp, y_max, 1)
         if self.aqu_type == "PI":
-            return self._poi(x, gp, y_max, self.xi)
+            return self._poi(x, gp, y_max, 1)
+
+    def _helper(self, x):
+        # (1) Get X and y from pool
+        df_pool = self.df.loc[self.pool_candidates]
+        # X = df_pool[list(df_pool.columns)[:-1]].values
+        # y = df_pool[list(df_pool.columns)[-1]].values
+
+        # (2) Processing
+        # y_max = np.max(y)
+        s_scaler = StandardScaler()
+        X_train = s_scaler.fit_transform(df_pool[list(df_pool.columns)[:-1]].values)
+        ###!!!y_train = s_scaler.fit_transform([[i] for i in y])!!!###
+        y_reshape = np.array(df_pool[list(df_pool.columns)[-1]].values).reshape(-1, 1)
+        y_train = s_scaler.fit_transform(y_reshape).flatten()
+        ###
+
+        RF_model = RandomForestRegressor(n_estimators=self.n_est, n_jobs=-1)
+        RF_model.fit(X_train, y_train)
+
+        # Fast way
+        # tree_predictions = list()
+
+        def predict_est(estimator, x):
+            return estimator.predict(x)
+
+        tree_predictions = Parallel(n_jobs=-1)(
+            delayed(predict_est)(RF_model.estimators_[j], x)
+            for j in np.arange(self.n_est)
+        )
+
+        mean = np.mean(np.array(tree_predictions), axis=0)[0]
+        std = np.std(np.array(tree_predictions), axis=0)[0]
+
+        return mean, std
 
     # @staticmethod
-    def _ucb(self, x, gp, kappa):  # Return numpy array of 1 element, x=input?
+    def _ucb(self, x, gp, kappa):
         """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -169,36 +218,12 @@ class RF(Model):
 
         return mean + kappa * std
         """
-        # (1) Get X and y from pool
-        df_pool = self.df.loc[self.pool_candidates]
-        X = df_pool[list(df_pool.columns)[:-1]].values
-        y = df_pool[list(df_pool.columns)[-1]].values
-
-        # (2) Processing
-        y_max = y.argmax
-        s_scaler = StandardScaler()
-        X_train = s_scaler.fit_transform(X)
-        y_train = s_scaler.fit_transform([[i] for i in y])
-        RF_model = RandomForestRegressor(n_estimators=self.n_est, n_jobs=-1)
-        RF_model.fit(X_train, y_train)
-
-        # (3) Loop through candidates and find smallest acquisition value
-        for idx in self.pool_candidates:
-            X_j = X[idx]
-            # Mean & STD
-            tree_predictions = []
-            for j in np.arange(self.n_est):
-                tree_predictions.append(
-                    (RF_model.estimators_[j].predict(np.array([X_j]))).tolist()
-                )
-            mean = np.mean(np.array(tree_predictions), axis=0)[0]
-            std = np.std(np.array(tree_predictions), axis=0)[0]
-
+        mean, std = self._helper(x)
         # (4) Acquisition
         return mean + (self.ucb_ratio * std)
 
     # @staticmethod
-    def _ei(self, x, gp, y_max, xi):  # Return numpy array of 1 element, x=input?
+    def _ei(self, x, gp, y_max, xi):
         """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -208,37 +233,54 @@ class RF(Model):
         z = a / std
         return a * norm.cdf(z) + std * norm.pdf(z)
         """
+        """
         # (1) Get X and y from pool
         df_pool = self.df.loc[self.pool_candidates]
         X = df_pool[list(df_pool.columns)[:-1]].values
         y = df_pool[list(df_pool.columns)[-1]].values
 
         # (2) Processing
-        y_max = y.argmax
+        y_max = np.max(y)
         s_scaler = StandardScaler()
         X_train = s_scaler.fit_transform(X)
-        y_train = s_scaler.fit_transform([[i] for i in y])
+        ###y_train = s_scaler.fit_transform([[i] for i in y])
+        y_reshape = np.array(y).reshape(-1, 1)
+        y_train = s_scaler.fit_transform(y_reshape).flatten()
+        ###
+
         RF_model = RandomForestRegressor(n_estimators=self.n_est, n_jobs=-1)
         RF_model.fit(X_train, y_train)
 
+        ###!!! I'm deciding to calc based on input X rather then loop through all candidates!!!
+        ###!!! Fix for other Acquisition functions!!!
         # (3) Loop through candidates and find smallest acquisition value
-        for idx in self.pool_candidates:
-            X_j = X[idx]
-            # Mean & STD
-            tree_predictions = []
-            for j in np.arange(self.n_est):
-                tree_predictions.append(
-                    (RF_model.estimators_[j].predict(np.array([X_j]))).tolist()
-                )
-            mean = np.mean(np.array(tree_predictions), axis=0)[0]
-            std = np.std(np.array(tree_predictions), axis=0)[0]
+
+        # Fast way
+        tree_predictions = list()
+
+        def predict_est(estimator, x):
+            return estimator.predict(x)
+
+        tree_predictions = Parallel(n_jobs=-1)(
+            delayed(predict_est)(RF_model.estimators_[j], x)
+            for j in np.arange(self.n_est)
+        )
+
+        mean = np.mean(np.array(tree_predictions), axis=0)[0]
+        std = np.std(np.array(tree_predictions), axis=0)[0]
+        """
+        mean, std = self._helper(x)
 
         # (4) Acquisition
-        z = (y_max - mean) / std
-        return (y_my_maxin - mean) * norm.cdf(z) + std * norm.pdf(z)
+        if std != 0.0:
+            z = (y_max - mean) / std
+        else:
+            z = 0
+        val = (y_max - mean) * norm.cdf(z) + std * norm.pdf(z)
+        return val
 
     # @staticmethod
-    def _poi(self, x, gp, y_max, xi):  # Return numpy array of 1 element, x=input?
+    def _poi(self, x, gp, y_max, xi):
         """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -247,33 +289,77 @@ class RF(Model):
         z = (mean - y_max - xi) / std
         return norm.cdf(z)
         """
-        # (1) Get X and y from pool
-        df_pool = self.df.loc[self.pool_candidates]
-        X = df_pool[list(df_pool.columns)[:-1]].values
-        y = df_pool[list(df_pool.columns)[-1]].values
 
-        # (2) Processing
-        y_max = y.argmax
-        s_scaler = StandardScaler()
-        X_train = s_scaler.fit_transform(X)
-        y_train = s_scaler.fit_transform([[i] for i in y])
-        RF_model = RandomForestRegressor(n_estimators=self.n_est, n_jobs=-1)
-        RF_model.fit(X_train, y_train)
-
-        # (3) Loop through candidates and find smallest acquisition value
-        for idx in self.pool_candidates:
-            X_j = X[idx]
-            # Mean & STD
-            tree_predictions = []
-            for j in np.arange(self.n_est):
-                tree_predictions.append(
-                    (RF_model.estimators_[j].predict(np.array([X_j]))).tolist()
-                )
-            mean = np.mean(np.array(tree_predictions), axis=0)[0]
-            std = np.std(np.array(tree_predictions), axis=0)[0]
+        mean, std = self._helper(x)
 
         # (4) Acquisition
         z = (y_max - mean) / std
         return norm.cdf(z)
 
     # ------------------- Acquisition -------------------
+
+
+if __name__ == "__main__":
+    PATH = os.getcwd()
+    PATH = PATH.split(os.path.sep)
+    if "src" in PATH:
+        PATH.remove("src")
+    PATH = os.path.sep.join(PATH)
+
+    def df_preprocessing(data_name: str) -> pd.DataFrame:
+        df = pd.read_csv(os.path.join(PATH, "datasets", data_name + "_dataset.csv"))
+        # (A) There are multiple of the same experiments, so average them!
+        features = list(df.columns)[:-1]
+        obj_metric = list(df.columns)[-1]
+        df = df.groupby(features)[obj_metric].agg(lambda x: x.unique().mean())
+        df = (df.to_frame()).reset_index()
+        # (B) Change all NECESSARY df to a maximization problem
+        if data_name not in ["P3HT", "Crossed barrel", "AutoAM"]:
+            # aka AgNP & Perovskite
+            df[obj_metric] = -df[obj_metric].values
+        return df
+
+    dataset_df = df_preprocessing("Crossed barrel")
+
+    template_model = RF(
+        n_est=10, ucb_ratio=10, df=dataset_df, n_top_candidates=0.05
+    )  # 100
+
+    template_dict = {
+        "EI": copy.deepcopy(template_model),
+        "POI": copy.deepcopy(template_model),
+        "UCB2": copy.deepcopy(template_model),
+    }
+    template_dict["EI"].acquisition_type = "EI"
+    template_dict["POI"].acquisition_type = "POI"
+    template_dict["UCB2"].acquisition_type = "UCB2"
+
+    random.seed(5853)
+    n_models = 50
+    n_models = [random.randint(0, 9999) for _ in range(n_models)]
+
+    for seed in n_models:
+        for key, val in template_dict.items():
+            Model = copy.copy(val)
+            Model.seed = seed
+
+            optimizer = BayesianOptimization(
+                f=Model.f_surrogate_model,
+                pbounds=Model.pbounds,
+                random_state=Model.seed,
+            )
+
+            while Model.metric() < 0.1:  # 1.0
+                next_point = optimizer.suggest(utility_function=Model)
+                Model.add_candidate(**next_point)
+                value = Model.f_surrogate_model(**next_point)
+                optimizer.register(params=next_point, target=value)
+
+                print(f"metric: {Model.metric()}")
+                print(f"next_point: {next_point}")
+                print(f"value: {value}")
+                # print(f"Model.pool_candidates: {Model.pool_candidates}")
+                print(f"Model.observed_candidates: {Model.observed_candidates}")
+
+            with open(f"{seed}_{key}.txt", "w") as f:
+                f.write("\n".join(map(str, Model.metric_history)))
