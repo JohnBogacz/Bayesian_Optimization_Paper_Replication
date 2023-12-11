@@ -4,6 +4,8 @@ import numpy as np
 from sklearn import preprocessing
 from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import norm
+import GPy
+import GPyOpt
 import math, os, random, copy, time, itertools, gc, time, warnings
 
 
@@ -37,6 +39,7 @@ class Model:
         self.lcb_ratio = ratio
         self.pth = pth
         self.identity = "INSERT MODEL NAME"
+        self.NUM_CORES = multiprocessing.cpu_count()
 
     def worker(self, tasks, results):
         lock = multiprocessing.Lock()  # IDK if needed
@@ -50,19 +53,18 @@ class Model:
                 results.put(result)
 
     def run(self):
-        NUM_CORES = multiprocessing.cpu_count()
-        tasks = multiprocessing.Queue()
+        manager = multiprocessing.Manager()
+        tasks = manager.Queue()
 
         for seed in self.seeds:
             tasks.put(seed)
-        for _ in range(NUM_CORES):
+        for _ in range(self.NUM_CORES):
             tasks.put(None)
 
         processes = list()
-        manager = multiprocessing.Manager()
         results = manager.Queue()
 
-        for _ in range(NUM_CORES):
+        for _ in range(self.NUM_CORES):
             process = multiprocessing.Process(target=self.worker, args=(tasks, results))
             processes.append(process)
             process.start()
@@ -211,6 +213,156 @@ class RF(Model):
         return result
 
 
+class GP(Model):
+    def __init__(
+        self, seeds, df, df_name, n_ensemble, n_initial, ac_type, ratio, pth, kernel
+    ) -> None:
+        super().__init__(seeds, df, df_name, n_ensemble, n_initial, ac_type, ratio, pth)
+
+        self.df_X_feature = self.df[list(self.df.columns)[:-1]].values
+        Bias = GPy.kern.Bias(self.df_X_feature.shape[1], variance=1.0)
+        k = {
+            "Matern52": GPy.kern.Matern52(
+                self.df_X_feature.shape[1], variance=1.0, ARD=False
+            )
+            + Bias,
+            "Matern52_ARD": GPy.kern.Matern52(
+                self.df_X_feature.shape[1], variance=1.0, ARD=True
+            )
+            + Bias,
+            "Matern32": GPy.kern.Matern32(
+                self.df_X_feature.shape[1], variance=1.0, ARD=False
+            )
+            + Bias,
+            "Matern32_ARD": GPy.kern.Matern32(
+                self.df_X_feature.shape[1], variance=1.0, ARD=True
+            )
+            + Bias,
+            "Matern12": GPy.kern.Exponential(
+                self.df_X_feature.shape[1], variance=1.0, ARD=False
+            )
+            + Bias,
+            "Matern12_ARD": GPy.kern.Exponential(
+                self.df_X_feature.shape[1], variance=1.0, ARD=True
+            )
+            + Bias,
+            "RBF": GPy.kern.RBF(self.df_X_feature.shape[1], variance=1.0, ARD=False)
+            + Bias,
+            "RBF_ARD": GPy.kern.RBF(self.df_X_feature.shape[1], variance=1.0, ARD=True)
+            + Bias,
+            "MLP": GPy.kern.MLP(self.df_X_feature.shape[1], variance=1.0, ARD=False)
+            + Bias,
+            "MLP_ARD": GPy.kern.MLP(self.df_X_feature.shape[1], variance=1.0, ARD=True)
+            + Bias,
+        }
+        if kernel not in [value for value in k.keys()]:
+            raise Exception
+        self.kernel = k[kernel]
+        self.identity = f"GP_{kernel}_{self.ac_type}_{self.df_name}"
+        self.NUM_CORES = max(multiprocessing.cpu_count() // 4, 1)
+
+    def acquisition_function(self, X_j, GP_model, y_best):
+        X_j = X_j.reshape([1, self.df_X_feature.shape[1]])
+        mean, std = GP_model.predict(X_j)[0][0][0], GP_model.predict(X_j)[1][0][0]
+        std = np.sqrt(std)
+
+        if self.ac_type == "EI":
+            xi = 0
+            z = (y_best - mean - xi) / std
+            return (y_best - mean - xi) * norm.cdf(z) + std * norm.pdf(z)
+        elif self.ac_type == "PI":
+            xi = 0
+            z = (y_best - mean - xi) / std
+            return norm.cdf(z)
+        else:  # LCB
+            return -mean + self.lcb_ratio * std
+
+    def main(self, input_seed):
+        feature_name = list(self.df.columns)[:-1]
+        objective_name = list(self.df.columns)[-1]
+        X_feature = self.df[feature_name].values
+        y = np.array(self.df[objective_name].values)
+
+        n_top = int(math.ceil(len(self.df[list(self.df.columns)[-1]].values) * 0.05))
+        top_indices = list(
+            self.df.sort_values(list(self.df.columns)[-1]).head(n_top).index
+        )
+
+        # Initialization
+        start_time = time.time()
+        index_collection = []
+        X_collection = []
+        y_collection = []
+        TopCount_collection = []
+        random.seed(input_seed)
+        indices = list(np.arange(self.N))
+        index_learn = indices.copy()
+        index_ = random.sample(index_learn, self.n_initial)
+        X_ = []
+        y_ = []
+        c = 0
+        TopCount_ = []
+        for i in index_:
+            X_.append(X_feature[i])
+            y_.append(y[i])
+            if i in top_indices:
+                c += 1
+            TopCount_.append(c)
+            index_learn.remove(i)
+        for i in np.arange(len(index_learn)):
+            y_best = np.min(y_)
+            s_scaler = preprocessing.StandardScaler()
+            X_train = s_scaler.fit_transform(X_)
+            y_train = s_scaler.fit_transform([[i] for i in y_])
+
+            try:
+                GP_learn = GPy.models.GPRegression(
+                    X=X_train, Y=y_train, kernel=self.kernel, noise_var=0.01
+                )
+                GP_learn.optimize_restarts(
+                    num_restarts=10,
+                    parallel=True,
+                    robust=True,
+                    optimizer="bfgs",
+                    max_iters=100,
+                    verbose=False,
+                )
+            except:
+                break
+
+            next_index = None
+            max_ac = -(10**10)
+            for j in index_learn:
+                X_j = X_feature[j]
+                y_j = y[j]
+                ac_value = self.acquisition_function(X_j, GP_learn, y_best)
+                if max_ac <= ac_value:
+                    max_ac = ac_value
+                    next_index = j
+            X_.append(X_feature[next_index])
+            y_.append(y[next_index])
+            if next_index in top_indices:
+                c += 1
+            TopCount_.append(c)
+            index_learn.remove(next_index)
+            index_.append(next_index)
+        # assert len(index_) == AutoAM_N
+        index_collection.append(index_)
+        X_collection.append(X_)
+        y_collection.append(y_)
+        TopCount_collection.append(TopCount_)
+
+        total_time = time.time() - start_time
+        result = {
+            "index_collection": index_collection,
+            "X_collection": X_collection,
+            "y_collection": y_collection,
+            "TopCount_collection": TopCount_collection,
+            "total_time": total_time,
+        }
+        return result
+
+
 if __name__ == "__main__":
     # Constants
     PATH = os.getcwd()
@@ -227,6 +379,10 @@ if __name__ == "__main__":
     del df
 
     NUM_MODELS = 50
+    NUM_ENSEMBLES = 100
+    NUM_INITIAL = 2
+    LCB_RATIO = 10
+
     # Create tasks
     models = multiprocessing.Queue()
     SEED_LIST = [random.randint(0, 9999) for _ in range(NUM_MODELS)]
@@ -238,17 +394,44 @@ if __name__ == "__main__":
                         seeds=SEED_LIST,
                         df=df,
                         df_name=name,
-                        n_ensemble=100,
-                        n_initial=2,
+                        n_ensemble=NUM_ENSEMBLES,
+                        n_initial=NUM_INITIAL,
                         ac_type=acquisition,
-                        ratio=10,
+                        ratio=LCB_RATIO,
                         pth=PATH,
                     )
-
+                    models.put(model)
                 else:  # GP
-                    continue
-                models.put(model)
+                    for k in [
+                        "Matern52",
+                        "Matern52_ARD",
+                        "Matern32",
+                        "Matern32_ARD",
+                        "Matern12",
+                        "Matern12_ARD",
+                        "RBF",
+                        "RBF_ARD",
+                        "MLP",
+                        "MLP_ARD",
+                    ]:
+                        model = GP(
+                            seeds=SEED_LIST,
+                            df=df,
+                            df_name=name,
+                            n_ensemble=NUM_ENSEMBLES,
+                            n_initial=NUM_INITIAL,
+                            ac_type=acquisition,
+                            ratio=LCB_RATIO,
+                            pth=PATH,
+                            kernel=k,
+                        )
+                        models.put(model)
+    start = time.time()
 
     while not models.empty():
         model = models.get()
-        x = model.run()
+        print(f"Running: {model.identity}")
+        model.run()
+
+    total = time.time() - start
+    print(f"total time: {total}")

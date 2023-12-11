@@ -1,4 +1,0 @@
-# python 3.10.13
-conda install -c conda-forge bayesian-optimization=1.4.3
-conda install -c conda-forge matplotlib
-conda install -c conda-forge pandas

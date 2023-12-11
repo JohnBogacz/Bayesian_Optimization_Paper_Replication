@@ -1,4 +1,0 @@
-# python 3.10.13
-bayesian-optimization=1.4.3
-matplotlib
-pandas
