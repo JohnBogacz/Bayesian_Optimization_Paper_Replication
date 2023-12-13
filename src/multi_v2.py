@@ -96,7 +96,6 @@ class Model:
             total_time=all_together["total_time"],
             identity=self.identity,
         )
-        return None
 
 
 class RF(Model):
@@ -143,10 +142,6 @@ class RF(Model):
 
         # Initialization
         start_time = time.time()
-        index_collection = []
-        X_collection = []
-        y_collection = []
-        TopCount_collection = []
         random.seed(input_seed)
         indices = list(np.arange(self.N))
         index_learn = indices.copy()
@@ -197,17 +192,12 @@ class RF(Model):
             index_learn.remove(next_index)
             index_.append(next_index)
 
-            index_collection.append(index_)
-            X_collection.append(X_)
-            y_collection.append(y_)
-            TopCount_collection.append(TopCount_)
-
         total_time = time.time() - start_time
         result = {
-            "index_collection": index_collection,
-            "X_collection": X_collection,
-            "y_collection": y_collection,
-            "TopCount_collection": TopCount_collection,
+            "index_collection": index_,
+            "X_collection": X_,
+            "y_collection": y_,
+            "TopCount_collection": TopCount_,
             "total_time": total_time,
         }
         return result
@@ -282,18 +272,13 @@ class GP(Model):
         objective_name = list(self.df.columns)[-1]
         X_feature = self.df[feature_name].values
         y = np.array(self.df[objective_name].values)
-
         n_top = int(math.ceil(len(self.df[list(self.df.columns)[-1]].values) * 0.05))
         top_indices = list(
             self.df.sort_values(list(self.df.columns)[-1]).head(n_top).index
         )
 
-        # Initialization
+        # START
         start_time = time.time()
-        index_collection = []
-        X_collection = []
-        y_collection = []
-        TopCount_collection = []
         random.seed(input_seed)
         indices = list(np.arange(self.N))
         index_learn = indices.copy()
@@ -314,7 +299,6 @@ class GP(Model):
             s_scaler = preprocessing.StandardScaler()
             X_train = s_scaler.fit_transform(X_)
             y_train = s_scaler.fit_transform([[i] for i in y_])
-
             try:
                 GP_learn = GPy.models.GPRegression(
                     X=X_train, Y=y_train, kernel=self.kernel, noise_var=0.01
@@ -329,13 +313,12 @@ class GP(Model):
                 )
             except:
                 break
-
             next_index = None
             max_ac = -(10**10)
             for j in index_learn:
                 X_j = X_feature[j]
                 y_j = y[j]
-                ac_value = self.acquisition_function(X_j, GP_learn, y_best)
+                ac_value = self.ac_type(X_j, GP_learn, y_best)
                 if max_ac <= ac_value:
                     max_ac = ac_value
                     next_index = j
@@ -346,18 +329,14 @@ class GP(Model):
             TopCount_.append(c)
             index_learn.remove(next_index)
             index_.append(next_index)
-        # assert len(index_) == AutoAM_N
-        index_collection.append(index_)
-        X_collection.append(X_)
-        y_collection.append(y_)
-        TopCount_collection.append(TopCount_)
-
         total_time = time.time() - start_time
+        # END
+
         result = {
-            "index_collection": index_collection,
-            "X_collection": X_collection,
-            "y_collection": y_collection,
-            "TopCount_collection": TopCount_collection,
+            "index_collection": index_,
+            "X_collection": X_,
+            "y_collection": y_,
+            "TopCount_collection": TopCount_,
             "total_time": total_time,
         }
         return result
@@ -378,13 +357,14 @@ if __name__ == "__main__":
     DATASET = df
     del df
 
-    NUM_MODELS = 50
-    NUM_ENSEMBLES = 100
+    NUM_MODELS = 10
+    NUM_ENSEMBLES = 10
     NUM_INITIAL = 2
-    LCB_RATIO = 10
+    LCB_RATIO = 2
 
     # Create tasks
     models = multiprocessing.Queue()
+    random.seed(5853)
     SEED_LIST = [random.randint(0, 9999) for _ in range(NUM_MODELS)]
     for name, df in DATASET.items():
         for acquisition in ["EI", "PI", "LCB"]:
